@@ -43,8 +43,8 @@ createAppKit({
   projectId: PROJECT_ID,
   features: { email: false, socials: false },
   metadata: {
-    name: 'StealthTap',
-    description: 'Gasless consolidation',
+    name: 'Trust Pay',
+    description: 'Gasless Transactions',
     url: typeof window !== 'undefined' ? window.location.origin : '',
     icons: [typeof window !== 'undefined' ? `${window.location.origin}/favicon.ico` : ''],
   }
